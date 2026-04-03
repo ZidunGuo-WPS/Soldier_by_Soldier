@@ -253,6 +253,7 @@ class BattleState:
 
     def combat_phase(self, rng: random.Random) -> None:
         max_pairs = 14
+        fight_summaries: List[Tuple[str, str, int, int]] = []
         for r in range(self.height):
             for c in range(self.width):
                 cell = self._cell(r, c)
@@ -276,6 +277,9 @@ class BattleState:
 
                 pa = groups["player"][:]
                 eb = groups["enemy"][:]
+                rep_p = pa[0].name
+                rep_e = eb[0].name
+                np_, ne_ = len(pa), len(eb)
                 rng.shuffle(pa)
                 rng.shuffle(eb)
                 n = min(len(pa), len(eb), max_pairs)
@@ -290,6 +294,14 @@ class BattleState:
                     for sol in eb[n:]:
                         tgt = rng.choice(pa)
                         self._one_sided_strike(sol, tgt, cell.terrain, rng, owners)
+                fight_summaries.append((rep_p, rep_e, np_, ne_))
+
+        if fight_summaries:
+            rp, re, np_, ne_ = fight_summaries[0]
+            if len(fight_summaries) == 1:
+                self.log.append(f"士卒混战：{np_}我方↔{ne_}敌方同格（{rp}·{re}）")
+            else:
+                self.log.append(f"士卒混战：{len(fight_summaries)} 处同格交兵（如 {rp}↔{re} 等）")
 
     def _officer_bonus(self, army_id: str) -> float:
         army = self.armies[army_id]
@@ -402,7 +414,9 @@ class BattleState:
             r, c = pos
             has_p, has_e = self._factions_in_cell(r, c)
             if not (has_p and has_e):
-                self.log.append(f"【主角】{hero.name} 未与敌同格混战，无法挥砍")
+                self.log.append(
+                    f"【主角】{hero.name} 未接战（近战需与敌在同一六角格；推进靠 tick 自动接敌）"
+                )
                 return
             enemies: List[Soldier] = []
             owners: Dict[str, Tuple[str, str]] = {}

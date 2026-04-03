@@ -14,6 +14,7 @@ import pygame
 from sbs.battle_sim import Terrain
 from sbs.fonts import pick_cjk_font
 from sbs.game_state import (
+    PROTAGONIST_ID,
     GameState,
     army_average_enemy_morale,
     army_average_fatigue,
@@ -209,8 +210,10 @@ TOP_ROT_RECT = pygame.Rect(404, 5, 190, 38)
 TOP_SPD_RECT = pygame.Rect(602, 5, 124, 38)
 TOP_STEP_RECT = pygame.Rect(730, 5, 176, 38)
 MANUAL_TICK_RECT = pygame.Rect(16, 49, 152, 36)
-# 会战页右侧：我军列表滚动区（与事件处理共用几何）
-PLAYER_LIST_RECT = pygame.Rect(642, 300, 626, 180)
+# 会战页右侧：我军列表滚动区、下方单位详情、战报（与事件处理共用几何）
+PLAYER_LIST_ROW_H = 48
+PLAYER_LIST_RECT = pygame.Rect(642, 300, 626, 178)
+PLAYER_DETAIL_RECT = pygame.Rect(642, 486, 626, 118)
 NEW_BATTLE_BTN_RECT = pygame.Rect(188, 352, 284, 48)
 HERO_MELEE_RECT = pygame.Rect(18, 90, 74, 32)
 HERO_RANGED_RECT = pygame.Rect(98, 90, 74, 32)
@@ -223,11 +226,44 @@ STRAT_H24_RECT = pygame.Rect(274, 54, 138, 34)
 
 def _player_list_scroll_bounds(state: GameState) -> Tuple[int, int]:
     soldiers = _player_alive_sorted(state)
-    line_h = 54
+    line_h = PLAYER_LIST_ROW_H
     header = 22
+    inner_h = PLAYER_LIST_RECT.height - 34
     content_h = header + len(soldiers) * line_h
-    max_scroll = max(0, content_h - PLAYER_LIST_RECT.height)
+    max_scroll = max(0, content_h - inner_h)
     return content_h, max_scroll
+
+
+def _player_list_hit_soldier_id(
+    mx: int, my: int, scroll_y: int, state: GameState
+) -> Optional[str]:
+    r = PLAYER_LIST_RECT
+    if not r.collidepoint(mx, my):
+        return None
+    inner = pygame.Rect(r.x + 6, r.y + 28, r.width - 12, r.height - 34)
+    if not inner.collidepoint(mx, my):
+        return None
+    soldiers = _player_alive_sorted(state)
+    rel_y = my - inner.y + scroll_y - 22
+    if rel_y < 0:
+        return None
+    idx = rel_y // PLAYER_LIST_ROW_H
+    if 0 <= idx < len(soldiers):
+        return soldiers[idx].id
+    return None
+
+
+def _normalize_detail_selection(state: GameState, sid: Optional[str]) -> Optional[str]:
+    if sid is None:
+        return None
+    sol = state.battle.soldiers.get(sid)
+    if sol and sol.alive and sol.faction == "player":
+        return sid
+    hero = state.battle.soldiers.get(PROTAGONIST_ID)
+    if hero and hero.alive:
+        return PROTAGONIST_ID
+    alive = _player_alive_sorted(state)
+    return alive[0].id if alive else None
 
 
 def _gear_one_line(sol: Soldier) -> str:
@@ -324,6 +360,7 @@ def run() -> None:
     state = new_demo_game(11)
     auto_ms = 0.0
     player_list_scroll = 0
+    selected_detail_id: Optional[str] = PROTAGONIST_ID
     running = True
 
     def tick_battle_once() -> None:
@@ -350,7 +387,7 @@ def run() -> None:
         return None
 
     def start_new_demo_battle() -> None:
-        nonlocal state, player_list_scroll, auto_ms
+        nonlocal state, player_list_scroll, auto_ms, selected_detail_id
         seed = (state.rng_seed + 7919) % 1_000_000
         mode = state.mode
         bts = state.battle_tick_speed
@@ -369,10 +406,11 @@ def run() -> None:
         state.battle_xp_settled = False
         player_list_scroll = 0
         auto_ms = 0.0
+        selected_detail_id = PROTAGONIST_ID
         state.battle.log.append("—— 新开演示会战 ——")
 
     def handle_click(mx: int, my: int) -> Optional[str]:
-        nonlocal state, player_list_scroll
+        nonlocal state, player_list_scroll, selected_detail_id
         if state.mode == "battle" and battle_outcome(state) and NEW_BATTLE_BTN_RECT.collidepoint(mx, my):
             start_new_demo_battle()
             return "new_battle"
@@ -397,6 +435,10 @@ def run() -> None:
             state.campaign_step_speed = (state.campaign_step_speed % 3) + 1
             return "top_step"
         if state.mode == "battle" and not battle_outcome(state):
+            pick = _player_list_hit_soldier_id(mx, my, player_list_scroll, state)
+            if pick is not None:
+                selected_detail_id = pick
+                return "player_pick"
             if MANUAL_TICK_RECT.collidepoint(mx, my):
                 tick_battle_once()
                 return "manual_tick"
@@ -452,6 +494,7 @@ def run() -> None:
                 elif event.key == pygame.K_F9 and SAVE_PATH.exists():
                     state = load_game(SAVE_PATH)
                     player_list_scroll = 0
+                    selected_detail_id = _normalize_detail_selection(state, PROTAGONIST_ID)
                     state.battle.log.append("已读档")
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
@@ -471,6 +514,7 @@ def run() -> None:
         draw_top_bar(screen, state, font_m, font_s, mouse_xy, ui_press_id, press_active)
 
         if state.mode == "battle":
+            selected_detail_id = _normalize_detail_selection(state, selected_detail_id)
             _, mx_sc = _player_list_scroll_bounds(state)
             player_list_scroll = min(player_list_scroll, mx_sc)
             draw_battle(
@@ -481,6 +525,7 @@ def run() -> None:
                 state,
                 battle_outcome(state),
                 player_list_scroll,
+                selected_detail_id,
                 mouse_xy,
                 ui_press_id,
                 press_active,
@@ -581,8 +626,12 @@ def draw_battle_legend(
     screen.blit(font_s.render("平地", True, TEXT), (x + 18, y - 2))
     screen.blit(font_s.render("河", True, TEXT), (x + 98, y - 2))
     screen.blit(font_s.render("高地", True, TEXT), (x + 178, y - 2))
-    line2 = "格内数字 我方|敌方 存活人数；与战场逻辑一致为 odd-r 六邻接推进。"
-    screen.blit(font_s.render(line2, True, MUTED), (x, y + 22))
+    line2 = "格内写作 我n|敌m：左为我方、右为敌方本格存活人数；odd-r 六邻接自动推进，无手动移格。"
+    surf2 = font_s.render(line2, True, MUTED)
+    if surf2.get_width() > max_width:
+        line2 = "格内 我n|敌m = 我方|敌方本格存活；六邻接自动推进。"
+        surf2 = font_s.render(line2, True, MUTED)
+    screen.blit(surf2, (x, y + 22))
     line3 = "疲劳条：绿≤65% 耐力负荷，红>65%（后撤换气阈值约72%见逻辑）。"
     surf3 = font_s.render(line3, True, MUTED)
     if surf3.get_width() > max_width:
@@ -603,25 +652,40 @@ def draw_player_list_block(
     font_s: pygame.font.Font,
     state: GameState,
     scroll_y: int,
+    selected_id: Optional[str],
 ) -> None:
     r = PLAYER_LIST_RECT
     pygame.draw.rect(screen, PANEL, r, width=2)
-    screen.blit(font_m.render("我军存活（滚轮滚动）", True, ACCENT), (r.x + 8, r.y + 6))
+    screen.blit(
+        font_m.render("我军存活（点行看详情 · 滚轮）", True, ACCENT),
+        (r.x + 8, r.y + 6),
+    )
     inner = pygame.Rect(r.x + 6, r.y + 28, r.width - 12, r.height - 34)
     prev_clip = screen.get_clip()
     screen.set_clip(inner)
+    row_h = PLAYER_LIST_ROW_H
     y0 = inner.y - scroll_y + 22
     soldiers = _player_alive_sorted(state)
     for sol in soldiers:
         if y0 > inner.bottom:
             break
-        block_bottom = y0 + 50
+        block_bottom = y0 + row_h - 2
         if block_bottom >= inner.y:
-            screen.blit(font_s.render(f"{sol.name}  HP {sol.hp:.0f}/{sol.hp_max:.0f}", True, TEXT), (inner.x, y0))
+            if sol.id == selected_id:
+                pygame.draw.rect(
+                    screen,
+                    (48, 56, 68),
+                    (inner.x, y0 - 1, inner.width, row_h - 2),
+                    border_radius=2,
+                )
+            screen.blit(
+                font_s.render(f"{sol.name}  HP {sol.hp:.0f}/{sol.hp_max:.0f}", True, TEXT),
+                (inner.x + 4, y0),
+            )
             fat_r = sol.fatigue / max(1.0, sol.fatigue_max())
             _draw_bar(
                 screen,
-                pygame.Rect(inner.x + 168, y0 + 2, 72, 10),
+                pygame.Rect(inner.x + 200, y0 + 1, 88, 9),
                 fat_r,
                 RED if fat_r > 0.65 else GREEN,
             )
@@ -630,13 +694,72 @@ def draw_player_list_block(
                 f"耐{sol.endurance:.0f} 健{sol.vitality:.0f}  "
                 f"单手{sol.prof.get('one_handed', 0):.0f} 弓{sol.prof.get('bow', 0):.0f}"
             )
-            screen.blit(font_s.render(st, True, MUTED), (inner.x, y0 + 16))
+            screen.blit(font_s.render(st, True, MUTED), (inner.x + 4, y0 + 14))
             wline = f"伤势:{_wound_summary_zh(sol)}  装备:{_gear_one_line(sol)}"
-            screen.blit(font_s.render(wline[:56], True, MUTED), (inner.x, y0 + 32))
-        y0 += 54
+            screen.blit(font_s.render(wline[:62], True, MUTED), (inner.x + 4, y0 + 30))
+        y0 += row_h
     if not soldiers:
         screen.blit(font_s.render("（无存活）", True, MUTED), (inner.x, inner.y + 8))
     screen.set_clip(prev_clip)
+
+
+def draw_soldier_detail_panel(
+    screen: pygame.Surface,
+    font_m: pygame.font.Font,
+    font_s: pygame.font.Font,
+    state: GameState,
+    soldier_id: Optional[str],
+) -> None:
+    r = PLAYER_DETAIL_RECT
+    pygame.draw.rect(screen, PANEL, r, width=2)
+    screen.blit(font_m.render("单位详情", True, ACCENT), (r.x + 8, r.y + 4))
+    ix = r.x + 8
+    iy = r.y + 26
+    sid = _normalize_detail_selection(state, soldier_id)
+    if sid is None:
+        screen.blit(font_s.render("无我军存活单位", True, MUTED), (ix, iy))
+        return
+    sol = state.battle.soldiers[sid]
+    tag = " · 主角" if sol.is_protagonist else ""
+    hp_r = sol.hp / max(1.0, sol.hp_max)
+    fat_r = sol.fatigue / max(1.0, sol.fatigue_max())
+    screen.blit(
+        font_s.render(f"{sol.name}{tag}  HP {sol.hp:.0f}/{sol.hp_max:.0f}", True, TEXT),
+        (ix, iy),
+    )
+    iy += 16
+    _draw_bar(screen, pygame.Rect(ix, iy, 200, 8), hp_r, RED)
+    _draw_bar(screen, pygame.Rect(ix + 208, iy, 96, 8), fat_r, RED if fat_r > 0.65 else GREEN)
+    iy += 12
+    screen.blit(
+        font_s.render(
+            f"力{sol.strength:.0f} 敏{sol.agility:.0f} 耐{sol.endurance:.0f} "
+            f"健{sol.vitality:.0f} 智{sol.wits:.0f}",
+            True,
+            MUTED,
+        ),
+        (ix, iy),
+    )
+    iy += 16
+    po = sol.prof.get("polearm", 0)
+    po_s = f" 枪{po:.0f}" if po > 0.5 else ""
+    screen.blit(
+        font_s.render(
+            f"单手{sol.prof.get('one_handed', 0):.0f} 弓{sol.prof.get('bow', 0):.0f}{po_s}",
+            True,
+            MUTED,
+        ),
+        (ix, iy),
+    )
+    iy += 16
+    screen.blit(font_s.render(f"装备 {_gear_one_line(sol)[:44]}", True, MUTED), (ix, iy))
+    iy += 16
+    pos = state.battle.positions.get(sol.id)
+    pos_s = f"地图格 行{pos[0]} 列{pos[1]}" if pos else "位置未知"
+    screen.blit(
+        font_s.render(f"伤势 {_wound_summary_zh(sol)}  ·  {pos_s}", True, MUTED),
+        (ix, iy),
+    )
 
 
 def draw_battle_end_overlay(
@@ -679,6 +802,7 @@ def draw_battle(
     state: GameState,
     outcome: Optional[str],
     player_scroll: int,
+    selected_detail_id: Optional[str],
     mouse_xy: Tuple[int, int],
     press_id: Optional[str],
     press_active: bool,
@@ -770,7 +894,7 @@ def draw_battle(
                     pc += 1
                 elif fac == "enemy":
                     ec += 1
-            label = font_s.render(f"{pc}|{ec}", True, TEXT)
+            label = font_s.render(f"我{pc}|敌{ec}", True, TEXT)
             screen.blit(label, (int(cx - label.get_width() // 2), int(cy - label.get_height() // 2)))
 
     draw_battle_legend(screen, font_s, state, 24, 478, 580)
@@ -778,10 +902,12 @@ def draw_battle(
     pygame.draw.rect(screen, PANEL, (642, 52, 626, 240), width=2)
     draw_army_summary_block(screen, font_l, font_m, font_s, state, 654, 56, compact=True)
 
-    draw_player_list_block(screen, font_m, font_s, state, player_scroll)
+    draw_player_list_block(screen, font_m, font_s, state, player_scroll, selected_detail_id)
 
-    pygame.draw.rect(screen, PANEL, (642, 488, 626, 176), width=2)
-    draw_log_block(screen, font_m, font_s, state, 654, 496, lines=7)
+    draw_soldier_detail_panel(screen, font_m, font_s, state, selected_detail_id)
+
+    pygame.draw.rect(screen, PANEL, (642, 612, 626, 108), width=2)
+    draw_log_block(screen, font_m, font_s, state, 654, 620, lines=5)
 
     if outcome:
         draw_battle_end_overlay(screen, font_m, font_s, outcome, mouse_xy, press_id, press_active)
