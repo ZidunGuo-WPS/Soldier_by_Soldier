@@ -16,6 +16,7 @@ class Soldier:
     name: str
     faction: str  # "player" | "enemy" | future factions
     is_elite_name: bool = False  # named officer path
+    is_protagonist: bool = False  # 玩家主角：与士卒同属性/成长，由玩家下达近战/远程等指令
     zone_key: Optional[str] = None  # optional legacy 5-zone UI (前左中右后)
 
     # Core attributes (float, unbounded); growth via exp pools

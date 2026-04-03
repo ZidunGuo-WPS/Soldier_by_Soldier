@@ -22,6 +22,26 @@ class Terrain(str, Enum):
     HIGH = "high"
 
 
+# Odd-r offset hex neighbors: same (row,col) storage as矩形底图，邻接为六向。
+_HEX_DR_DC_EVEN = ((+1, 0), (+1, -1), (0, -1), (-1, -1), (-1, 0), (0, +1))
+_HEX_DR_DC_ODD = ((+1, +1), (+1, 0), (0, -1), (-1, 0), (-1, +1), (0, +1))
+
+
+def hex_neighbor_deltas(row: int) -> Tuple[Tuple[int, int], ...]:
+    return _HEX_DR_DC_ODD if (row & 1) else _HEX_DR_DC_EVEN
+
+
+def hex_neighbors(
+    row: int, col: int, width: int, height: int
+) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    for dr, dc in hex_neighbor_deltas(row):
+        nr, nc = row + dr, col + dc
+        if 0 <= nr < height and 0 <= nc < width:
+            out.append((nr, nc))
+    return out
+
+
 @dataclass
 class UnitRef:
     army_id: str
@@ -99,14 +119,6 @@ class BattleState:
         sol = self.soldiers[sid]
         sol.add_fatigue(terrain_fatigue_on_enter(self._cell(r1, c1).terrain) * 0.15)
 
-    def _enemy_direction(self, faction: str) -> int:
-        """Row delta toward enemy: player (south start) moves up (-1), enemy moves down (+1)."""
-        return -1 if faction == "player" else 1
-
-    def _home_direction(self, faction: str) -> int:
-        """Toward own rear: opposite of toward enemy."""
-        return 1 if faction == "player" else -1
-
     def setup_demo_skirmish(self, rng: random.Random) -> None:
         """Small battle for testing: 6x5 grid, river middle band."""
         self.cells = [[Cell(Terrain.PLAIN) for _ in range(self.width)] for _ in range(self.height)]
@@ -147,7 +159,13 @@ class BattleState:
                 has_e = True
         return has_p, has_e
 
-    def movement_phase(self, rng: random.Random) -> None:
+    def _protagonist(self) -> Optional[Soldier]:
+        for s in self.soldiers.values():
+            if s.is_protagonist and s.faction == "player":
+                return s
+        return None
+
+    def movement_phase(self, rng: random.Random, siege_defense: bool) -> None:
         refs: List[Tuple[UnitRef, int, int]] = []
         for r in range(self.height):
             for c in range(self.width):
@@ -159,22 +177,32 @@ class BattleState:
             sol = self.soldiers.get(u.soldier_id)
             if sol is None or not sol.alive:
                 continue
+            if sol.is_protagonist and siege_defense:
+                continue
             has_p, has_e = self._factions_in_cell(r, c)
             if has_p and has_e:
                 continue
             army = self.armies[u.army_id]
-            dr = self._enemy_direction(army.faction)
-            # try advance
-            nr, nc = r + dr, c
-            if not self._in_bounds(nr, nc):
+            nbrs = hex_neighbors(r, c, self.width, self.height)
+            if army.faction == "player":
+                best = min(nr for nr, _ in nbrs)
+                candidates = [(nr, nc) for nr, nc in nbrs if nr == best]
+            else:
+                best = max(nr for nr, _ in nbrs)
+                candidates = [(nr, nc) for nr, nc in nbrs if nr == best]
+            rng.shuffle(candidates)
+            moved = False
+            for nr, nc in candidates:
+                move_roll = terrain_move_mult(self._cell(nr, nc).terrain) * sol.mobility_mult()
+                if rng.random() > min(0.95, 0.55 + 0.25 * move_roll):
+                    continue
+                self._move_unit(u.soldier_id, (r, c), (nr, nc))
+                moved = True
+                break
+            if not moved:
                 continue
-            move_roll = terrain_move_mult(self._cell(nr, nc).terrain) * sol.mobility_mult()
-            if rng.random() > min(0.95, 0.55 + 0.25 * move_roll):
-                continue
-            # enter if not blocked by "only enemies and no allies" - can always enter to mix
-            self._move_unit(u.soldier_id, (r, c), (nr, nc))
 
-    def rotation_phase(self, rng: random.Random) -> None:
+    def rotation_phase(self, rng: random.Random, siege_defense: bool) -> None:
         """Player troops fall back when exhausted unless fight_to_death."""
         for aid, army in self.armies.items():
             if army.faction != "player":
@@ -184,6 +212,8 @@ class BattleState:
             for sid in list(army.soldier_ids):
                 sol = self.soldiers.get(sid)
                 if sol is None or not sol.alive:
+                    continue
+                if sol.is_protagonist and siege_defense:
                     continue
                 pos = self.positions.get(sid)
                 if pos is None:
@@ -197,20 +227,29 @@ class BattleState:
                     continue
                 if rng.random() > 0.35 * army.retreat_speed_mult():
                     continue
-                back_dr = self._home_direction(army.faction)
-                br, bc = r + back_dr, c
-                if not self._in_bounds(br, bc):
-                    continue
-                bcell = self._cell(br, bc)
-                _, benemy = self._factions_in_cell(br, bc)
-                if benemy:
-                    continue
+                nbrs = hex_neighbors(r, c, self.width, self.height)
+                if army.faction == "player":
+                    back_best = max(nr for nr, _ in nbrs)
+                    back_cands = [(nr, nc) for nr, nc in nbrs if nr == back_best]
+                else:
+                    back_best = min(nr for nr, _ in nbrs)
+                    back_cands = [(nr, nc) for nr, nc in nbrs if nr == back_best]
+                rng.shuffle(back_cands)
                 ref = UnitRef(aid, sid)
-                self._remove_unit_at(r, c, ref)
-                self._add_unit_at(br, bc, ref)
-                self.positions[sid] = (br, bc)
-                sol.add_fatigue(2.0)
-                self.log.append(f"{sol.name} 后撤换气")
+                retreated = False
+                for br, bc in back_cands:
+                    _, benemy = self._factions_in_cell(br, bc)
+                    if benemy:
+                        continue
+                    self._remove_unit_at(r, c, ref)
+                    self._add_unit_at(br, bc, ref)
+                    self.positions[sid] = (br, bc)
+                    sol.add_fatigue(2.0)
+                    self.log.append(f"{sol.name} 后撤换气")
+                    retreated = True
+                    break
+                if not retreated:
+                    continue
 
     def combat_phase(self, rng: random.Random) -> None:
         max_pairs = 14
@@ -266,7 +305,10 @@ class BattleState:
     ) -> None:
         if not attacker.alive or not defender.alive:
             return
-        aid, _ = owners[attacker.id]
+        if attacker.id in owners:
+            aid, _ = owners[attacker.id]
+        else:
+            aid = self.army_for_soldier(attacker.id).id
         dmg = self._roll_damage(attacker, defender, terrain, rng, self._officer_bonus(aid))
         self._apply_damage(defender, dmg, rng)
         attacker.add_fatigue(1.2)
@@ -311,12 +353,125 @@ class BattleState:
         raw *= 1.0 + 0.035 * sk / (12.0 + sk)
         return max(0.5, raw)
 
-    def _apply_damage(self, target: Soldier, dmg: float, rng: random.Random) -> None:
+    def _roll_ranged_damage(
+        self,
+        attacker: Soldier,
+        defender: Soldier,
+        terrain: Terrain,
+        rng: random.Random,
+        siege_defense: bool,
+    ) -> float:
+        spread = 0.88 + 0.28 * rng.random()
+        base = 4.2 + 2.5 * rng.random()
+        form_jitter = 1.0 + rng.uniform(-0.1, 0.1)
+        high = terrain_ranged_mult(terrain)
+        raw = base * spread * form_jitter * high
+        aid = self.army_for_soldier(attacker.id).id
+        raw *= attacker.damage_multiplier(self._officer_bonus(aid))
+        raw *= defender.received_damage_multiplier()
+        sk = effect_bonus(attacker.prof.get("bow", 0.0), 26.0)
+        raw *= 1.0 + 0.045 * sk / (10.0 + sk)
+        if siege_defense:
+            raw *= 1.16 + 0.14 * rng.random()
+            raw *= 1.0 + 0.004 * effect_bonus(attacker.wits, 32.0)
+        return max(0.8, raw)
+
+    def _grant_ranged_exp(self, sol: Soldier, amount: float) -> None:
+        sol.agility, sol.exp_agility, _ = apply_exp(sol.agility, sol.exp_agility, amount * 0.22)
+        sol.wits, sol.exp_wits, _ = apply_exp(sol.wits, sol.exp_wits, amount * 0.18)
+        pkey = "bow"
+        cur = sol.prof.get(pkey, 0.0)
+        pool = sol.exp_prof.get(pkey, 0.0)
+        cur, pool, _ = apply_exp(cur, pool, amount * 0.9)
+        sol.prof[pkey] = cur
+        sol.exp_prof[pkey] = pool
+        sol.sync_hp_cap()
+
+    def protagonist_action_phase(
+        self, rng: random.Random, action: str, siege_defense: bool
+    ) -> None:
+        if action not in ("melee", "ranged"):
+            return
+        hero = self._protagonist()
+        if hero is None or not hero.alive:
+            return
+        if action == "melee":
+            pos = self.positions.get(hero.id)
+            if pos is None:
+                return
+            r, c = pos
+            has_p, has_e = self._factions_in_cell(r, c)
+            if not (has_p and has_e):
+                self.log.append(f"【主角】{hero.name} 未与敌同格混战，无法挥砍")
+                return
+            enemies: List[Soldier] = []
+            owners: Dict[str, Tuple[str, str]] = {}
+            for u in self._cell(r, c).units:
+                army = self.armies[u.army_id]
+                sol = self.soldiers[u.soldier_id]
+                if not sol.alive:
+                    continue
+                owners[sol.id] = (u.army_id, army.faction)
+                if army.faction == "enemy":
+                    enemies.append(sol)
+            if not enemies:
+                return
+            tgt = rng.choice(enemies)
+            terrain = self._cell(r, c).terrain
+            aid = self.army_for_soldier(hero.id).id
+            dmg = self._roll_damage(hero, tgt, terrain, rng, self._officer_bonus(aid)) * 1.12
+            was_alive = tgt.alive
+            self._apply_damage(tgt, dmg, rng, announce_death=False)
+            hero.add_fatigue(1.8)
+            self._grant_combat_exp(hero, 0.42)
+            if was_alive and not tgt.alive:
+                self.log.append(f"【主角】{hero.name} 斩杀 {tgt.name}！（近战）")
+            else:
+                self.log.append(f"【主角】{hero.name} 劈砍 {tgt.name}，伤 {dmg:.0f}")
+        else:
+            hp = self.positions.get(hero.id)
+            if hp is None:
+                return
+            hr, _hc = hp
+            pool: List[Soldier] = []
+            for sid, (er, _ec) in self.positions.items():
+                sol = self.soldiers.get(sid)
+                if not sol or not sol.alive or sol.faction != "enemy":
+                    continue
+                if er < hr:
+                    pool.append(sol)
+            if not pool:
+                for sol in self.soldiers.values():
+                    if sol.alive and sol.faction == "enemy":
+                        pool.append(sol)
+            if not pool:
+                self.log.append("【主角】箭下已无立锥之敌")
+                return
+            tgt = rng.choice(pool)
+            tr, tc = self.positions[tgt.id]
+            tterrain = self._cell(tr, tc).terrain
+            dmg = self._roll_ranged_damage(hero, tgt, tterrain, rng, siege_defense)
+            was_alive = tgt.alive
+            self._apply_damage(tgt, dmg, rng, announce_death=False)
+            hero.add_fatigue(1.05)
+            self._grant_ranged_exp(hero, 0.52)
+            thrill = dmg >= 22.0 or (siege_defense and dmg >= 18.0)
+            if thrill and rng.random() < 0.45:
+                self.log.append(f"【主角】弦响箭至！{tgt.name} 受创 {dmg:.0f}（痛快！）")
+            else:
+                self.log.append(f"【主角】箭射 {tgt.name}，伤 {dmg:.0f}")
+            if was_alive and not tgt.alive:
+                self.log.append(f"【主角】{tgt.name} 中箭倒地")
+
+    def _apply_damage(
+        self, target: Soldier, dmg: float, rng: random.Random, *, announce_death: bool = True
+    ) -> None:
         target.hp -= dmg
         if target.hp <= 0:
             target.hp = 0
             target.alive = False
-            self.log.append(f"{target.name} 阵亡")
+            if announce_death:
+                self.log.append(f"{target.name} 阵亡")
             return
         if dmg > 12 and rng.random() < 0.12:
             target.wounds.append(
@@ -365,11 +520,18 @@ class BattleState:
                         self.positions.pop(u.soldier_id, None)
                 cell.units = kept
 
-    def tick(self, rng: random.Random) -> None:
+    def tick(
+        self,
+        rng: random.Random,
+        *,
+        hero_action: str = "hold",
+        siege_defense: bool = False,
+    ) -> None:
         self.tick_index += 1
         self.log = self.log[-80:]
-        self.movement_phase(rng)
-        self.rotation_phase(rng)
+        self.protagonist_action_phase(rng, hero_action, siege_defense)
+        self.movement_phase(rng, siege_defense)
+        self.rotation_phase(rng, siege_defense)
         self.combat_phase(rng)
         self.cleanup_dead()
 

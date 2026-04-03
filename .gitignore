@@ -5,3 +5,5 @@ venv/
 .env
 *.save.json
 save_game.json
+product-development-log.md
+discussion.md

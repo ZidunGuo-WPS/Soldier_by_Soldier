@@ -10,9 +10,11 @@ from sbs.army import Army
 from sbs.battle_sim import BattleState, Cell, Terrain, UnitRef
 from sbs.equipment import Gear
 from sbs.officer import Officer, OfficerRank
-from sbs.scaling import enemy_morale_from_training
+from sbs.scaling import apply_exp, enemy_morale_from_training
 from sbs.soldier import Soldier
 from sbs.wounds import BodyPart, Wound, WoundSeverity
+
+PROTAGONIST_ID = "protagonist"
 
 
 @dataclass
@@ -27,6 +29,10 @@ class GameState:
     mode: str = "battle"  # "strategy" | "battle"
     fight_to_death: bool = False
     allow_rotation: bool = True
+    # 主角：每 tick 执行一次指令（近战/射箭/待命）；守城时主角不自动推进、射箭有加成
+    hero_stance: str = "hold"  # "melee" | "ranged" | "hold"
+    siege_mode: bool = False
+    battle_xp_settled: bool = False  # 本会战是否已结算主角战后经验
 
     def rng(self) -> random.Random:
         return random.Random(self.rng_seed + self.battle.tick_index * 9973)
@@ -60,6 +66,7 @@ def _make_soldier(d: Dict[str, Any]) -> Soldier:
         name=d["name"],
         faction=d["faction"],
         is_elite_name=bool(d.get("is_elite_name", False)),
+        is_protagonist=bool(d.get("is_protagonist", False)),
         zone_key=d.get("zone_key"),
         strength=float(d.get("strength", 10)),
         agility=float(d.get("agility", 10)),
@@ -91,6 +98,7 @@ def _soldier_to_dict(s: Soldier) -> Dict[str, Any]:
         "name": s.name,
         "faction": s.faction,
         "is_elite_name": s.is_elite_name,
+        "is_protagonist": s.is_protagonist,
         "zone_key": s.zone_key,
         "strength": s.strength,
         "agility": s.agility,
@@ -235,6 +243,9 @@ def game_to_dict(g: GameState) -> Dict[str, Any]:
         "mode": g.mode,
         "fight_to_death": g.fight_to_death,
         "allow_rotation": g.allow_rotation,
+        "hero_stance": g.hero_stance,
+        "siege_mode": g.siege_mode,
+        "battle_xp_settled": g.battle_xp_settled,
         "battle": _battle_to_dict(g.battle),
     }
 
@@ -249,7 +260,12 @@ def game_from_dict(d: Dict[str, Any]) -> GameState:
         mode=str(d.get("mode", "battle")),
         fight_to_death=bool(d.get("fight_to_death", False)),
         allow_rotation=bool(d.get("allow_rotation", True)),
+        hero_stance=str(d.get("hero_stance", "hold")),
+        siege_mode=bool(d.get("siege_mode", False)),
+        battle_xp_settled=bool(d.get("battle_xp_settled", False)),
     )
+    if g.hero_stance not in ("melee", "ranged", "hold"):
+        g.hero_stance = "hold"
     g.apply_player_doctrine()
     return g
 
@@ -267,7 +283,7 @@ def new_demo_game(seed: int = 7) -> GameState:
     rng = random.Random(seed)
     soldiers: Dict[str, Soldier] = {}
     p_ids: List[str] = []
-    for i in range(10):
+    for i in range(9):
         sid = f"p{i+1}"
         p_ids.append(sid)
         soldiers[sid] = Soldier(
@@ -278,11 +294,36 @@ def new_demo_game(seed: int = 7) -> GameState:
             agility=10 + rng.random() * 2,
             endurance=12 + rng.random() * 2,
             vitality=11 + rng.random() * 2,
-            prof={"one_handed": 8 + rng.random() * 4, "polearm": 2},
+            prof={"one_handed": 8 + rng.random() * 4, "polearm": 2, "bow": 1 + rng.random() * 2},
             fatigue=rng.random() * 8,
             form_bias=rng.uniform(-0.1, 0.1),
             gear=[Gear("weapon", "环首刀", 3), Gear("body", "皮甲", 2)],
         )
+    soldiers[PROTAGONIST_ID] = Soldier(
+        id=PROTAGONIST_ID,
+        name="你",
+        faction="player",
+        is_elite_name=True,
+        is_protagonist=True,
+        strength=12 + rng.random() * 2,
+        agility=11 + rng.random() * 2,
+        endurance=12 + rng.random() * 2,
+        vitality=12 + rng.random() * 2,
+        wits=10 + rng.random() * 2,
+        prof={
+            "one_handed": 9 + rng.random() * 3,
+            "bow": 10 + rng.random() * 4,
+            "polearm": 2,
+        },
+        fatigue=rng.random() * 5,
+        form_bias=rng.uniform(-0.08, 0.08),
+        gear=[
+            Gear("weapon", "环首刀", 3),
+            Gear("ranged", "角弓", 4),
+            Gear("body", "皮甲", 2),
+        ],
+    )
+    p_ids.insert(4, PROTAGONIST_ID)
     e_ids: List[str] = []
     for i in range(12):
         sid = f"e{i+1}"
@@ -337,9 +378,40 @@ def new_demo_game(seed: int = 7) -> GameState:
     cells: List[List[Cell]] = [[Cell() for _ in range(w)] for _ in range(h)]
     battle = BattleState(w, h, cells, soldiers, armies, {})
     battle.setup_demo_skirmish(rng)
-    g = GameState(rng_seed=seed, battle=battle)
+    g = GameState(rng_seed=seed, battle=battle, battle_xp_settled=False)
     g.apply_player_doctrine()
     return g
+
+
+def grant_post_battle_xp(state: GameState, outcome_zh: str) -> None:
+    """会战结束时结算主角经验（战斗中已有近战/射箭即时成长，此处为总结算）。"""
+    hero = state.battle.soldiers.get(PROTAGONIST_ID)
+    if hero is None:
+        for s in state.battle.soldiers.values():
+            if s.is_protagonist and s.faction == "player":
+                hero = s
+                break
+    if hero is None or not hero.alive:
+        return
+    mult = 1.0 if outcome_zh == "我军胜" else 0.4
+    t = state.battle.tick_index
+    base = 3.8 * mult * (1.0 + min(2.5, t * 0.018))
+    hero.strength, hero.exp_strength, _ = apply_exp(hero.strength, hero.exp_strength, base * 0.2)
+    hero.agility, hero.exp_agility, _ = apply_exp(hero.agility, hero.exp_agility, base * 0.18)
+    hero.endurance, hero.exp_endurance, _ = apply_exp(hero.endurance, hero.exp_endurance, base * 0.2)
+    hero.vitality, hero.exp_vitality, _ = apply_exp(hero.vitality, hero.exp_vitality, base * 0.18)
+    hero.wits, hero.exp_wits, _ = apply_exp(hero.wits, hero.exp_wits, base * 0.12)
+    for key in ("one_handed", "bow"):
+        cur = hero.prof.get(key, 0.0)
+        pool = hero.exp_prof.get(key, 0.0)
+        cur, pool, _ = apply_exp(cur, pool, base * 0.35)
+        hero.prof[key] = cur
+        hero.exp_prof[key] = pool
+    hero.battles_fought += 1.0
+    hero.sync_hp_cap()
+    state.battle.log.append(
+        f"【主角战后结算】{hero.name} 获得历练（{outcome_zh}，约 {base:.1f} 基准）"
+    )
 
 
 def army_average_fatigue(battle: BattleState, army: Army) -> float:
