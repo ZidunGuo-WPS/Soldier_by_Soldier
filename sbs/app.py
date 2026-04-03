@@ -644,6 +644,12 @@ def draw_battle_legend(
     )
     h2 = font_s.render(hero_line[:52], True, MUTED)
     screen.blit(h2, (x, y + 60))
+    gold_ln = "金色六角描边 = 主角「你」所在格（可与敌同格混战）。"
+    g2 = font_s.render(gold_ln, True, MUTED)
+    if g2.get_width() > max_width:
+        gold_ln = "金边六角格 = 主角所在（可混战格）。"
+        g2 = font_s.render(gold_ln, True, MUTED)
+    screen.blit(g2, (x, y + 78))
 
 
 def draw_player_list_block(
@@ -877,6 +883,11 @@ def draw_battle(
     origin_y = by + (hex_area_h - gh) * 0.5 - mn_y
     edge = (60, 65, 72)
 
+    hero_pos: Optional[Tuple[int, int]] = None
+    hero_sol = b.soldiers.get(PROTAGONIST_ID)
+    if hero_sol and hero_sol.alive:
+        hero_pos = b.positions.get(PROTAGONIST_ID)
+
     for r in range(b.height):
         for c in range(b.width):
             cell = b.cells[r][c]
@@ -896,6 +907,8 @@ def draw_battle(
                     ec += 1
             label = font_s.render(f"我{pc}|敌{ec}", True, TEXT)
             screen.blit(label, (int(cx - label.get_width() // 2), int(cy - label.get_height() // 2)))
+            if hero_pos is not None and (r, c) == hero_pos:
+                pygame.draw.polygon(screen, (218, 175, 55), pts, 3)
 
     draw_battle_legend(screen, font_s, state, 24, 478, 580)
 

@@ -244,12 +244,33 @@ class BattleState:
                     self._remove_unit_at(r, c, ref)
                     self._add_unit_at(br, bc, ref)
                     self.positions[sid] = (br, bc)
-                    sol.add_fatigue(2.0)
-                    self.log.append(f"{sol.name} 后撤换气")
+                    fm = max(1.0, sol.fatigue_max())
+                    rest = max(2.0, 0.06 * fm * army.retreat_speed_mult())
+                    before = sol.fatigue
+                    sol.recover_fatigue(rest)
+                    dropped = before - sol.fatigue
+                    self.log.append(f"{sol.name} 后撤换气（缓力 −{dropped:.0f}）")
                     retreated = True
                     break
                 if not retreated:
                     continue
+
+    def fatigue_recovery_phase(self) -> None:
+        """Non-contested cells: drain fatigue each tick (后方换气)."""
+        for sid, pos in list(self.positions.items()):
+            sol = self.soldiers.get(sid)
+            if sol is None or not sol.alive:
+                continue
+            r, c = pos
+            has_p, has_e = self._factions_in_cell(r, c)
+            if has_p and has_e:
+                continue
+            fm = max(1.0, sol.fatigue_max())
+            if sol.fatigue <= 0.0:
+                continue
+            # Slow passive recovery in non-melee cells (~0.2%–0.35% of max per tick).
+            rate = 0.0020 * (1.0 + 0.04 * sol.endurance)
+            sol.recover_fatigue(fm * rate)
 
     def combat_phase(self, rng: random.Random) -> None:
         max_pairs = 14
@@ -547,6 +568,7 @@ class BattleState:
         self.movement_phase(rng, siege_defense)
         self.rotation_phase(rng, siege_defense)
         self.combat_phase(rng)
+        self.fatigue_recovery_phase()
         self.cleanup_dead()
 
     def alive_counts(self) -> Tuple[int, int]:

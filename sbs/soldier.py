@@ -99,5 +99,8 @@ class Soldier:
     def add_fatigue(self, amount: float) -> None:
         self.fatigue = min(self.fatigue_max() * 1.2, self.fatigue + amount)
 
+    def recover_fatigue(self, amount: float) -> None:
+        self.fatigue = max(0.0, self.fatigue - amount)
+
     def gear_by_slot(self) -> dict[str, Gear]:
         return {g.slot: g for g in self.gear}
